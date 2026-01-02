@@ -1,0 +1,63 @@
+import time
+import random
+import string
+ # ----------------- Trie 性能基准工具 -----------------
+def _random_name(min_len=3, max_len=10):
+    return "".join(random.choices(string.ascii_lowercase, k=random.randint(min_len, max_len)))
+
+
+def bench_trie(n=20000, q=200, seed=42):
+    """在内存中对 Trie 与朴素 startswith 做插入/查询/删除性能对比。"""
+    random.seed(seed)
+    names = [_random_name() for _ in range(n)]
+
+    trie = Trie()
+
+    # insert benchmark for trie
+    t0 = time.perf_counter()
+    for i, name in enumerate(names):
+        trie.insert(name, i)
+    t_insert_trie = time.perf_counter() - t0
+
+    # prepare prefixes
+    prefixes = [names[random.randrange(n)][: random.randint(1, 4)] for _ in range(q)]
+
+    # trie prefix queries
+    t0 = time.perf_counter()
+    for p in prefixes:
+        _ = trie.search_prefix(p)
+    t_query_trie = time.perf_counter() - t0
+
+    # naive prefix scan queries
+    t0 = time.perf_counter()
+    for p in prefixes:
+        for name in names:
+            if name.startswith(p):
+                pass
+    t_query_naive = time.perf_counter() - t0
+
+    # delete benchmark for trie
+    t0 = time.perf_counter()
+    for i, name in enumerate(names):
+        trie.delete(name, i)
+    t_delete_trie = time.perf_counter() - t0
+
+    def ms(x):
+        return f"{x*1000:.2f} ms"
+
+    print("\nTrie 性能基准结果：")
+    print(f"  items: {n}, queries: {q}")
+    print(f"  插入 - trie: {ms(t_insert_trie)}")
+    print(f"  前缀查询 - trie: {ms(t_query_trie)}, 朴素扫描: {ms(t_query_naive)}")
+    print(f"  删除 - trie: {ms(t_delete_trie)}")
+    
+    elif choice == "7":
+            try:
+                n_in = input("请输入要生成的名字数量 n（回车使用默认20000）：").strip()
+                q_in = input("请输入要执行的查询次数 q（回车使用默认200）：").strip()
+                n = int(n_in) if n_in else 20000
+                q = int(q_in) if q_in else 200
+            except Exception:
+                print("输入无效，使用默认参数 n=20000, q=200")
+                n, q = 20000, 200
+            bench_trie(n=n, q=q)       
