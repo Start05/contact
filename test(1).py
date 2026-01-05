@@ -153,7 +153,7 @@ class ContactList:
         self.next_id += 1
 
         # 记录 WAL（包含 id）并执行添加，然后持久化快照（原子替换）
-        entry = {"op": "add", "data": {"id": contact_id, "name": name, "phone_number": phone_number, "remark": remark, "gender": gender}}
+        entry = {"op": "add", "data": {"id": contact_id, "name": name, "phone_number": phone_number, "remark": remark, "gender": gender, "blacklisted": False}}
         try:
             self._wal_append(entry)
         except Exception:
@@ -161,7 +161,7 @@ class ContactList:
             return False
 
         # 执行内存添加（不再检查 WAL）
-        contact = {"id": contact_id, "name": name, "phone_number": phone_number, "remark": remark, "gender": gender}
+        contact = {"id": contact_id, "name": name, "phone_number": phone_number, "remark": remark, "gender": gender, "blacklisted": False}
         self.contacts.append(contact)
         try:
             self.trie.insert(name, contact_id)
@@ -342,7 +342,8 @@ class ContactList:
             print("联系人列表为空。")
             return
         for i, c in enumerate(self.contacts, start=1):
-            print(f"{i}. 名称: {c.get('name')}, 电话: {c.get('phone_number')}, 性别: {c.get('gender')}, 备注: {c.get('remark')}")
+            status = "黑名单" if c.get("blacklisted") else "正常"
+            print(f"{i}. 名称: {c.get('name')}, 电话: {c.get('phone_number')}, 性别: {c.get('gender')}, 状态: {status}, 备注: {c.get('remark')}")
 
     def sort_contacts_by_initial(self):
         """按姓名首字母（首字符）排序联系人列表，修改原列表顺序。"""
@@ -499,7 +500,7 @@ class ContactList:
                             # 确保 next_id 大于已使用 id
                             if wid >= self.next_id:
                                 self.next_id = wid + 1
-                        contact = {"id": wid, "name": data.get("name"), "phone_number": data.get("phone_number"), "remark": data.get("remark"), "gender": data.get("gender", "")}
+                        contact = {"id": wid, "name": data.get("name"), "phone_number": data.get("phone_number"), "remark": data.get("remark"), "gender": data.get("gender", ""), "blacklisted": data.get("blacklisted", False)}
                         self.contacts.append(contact)
                         try:
                             self.trie.insert(contact.get("name"), contact.get("id"))
@@ -574,14 +575,62 @@ class ContactList:
                             contact["remark"] = new_remark
                         if new_gender is not None:
                             contact["gender"] = new_gender
+                        # 支持通过 edit 操作更改黑名单状态（可选字段 new_blacklisted）
+                        if data.get("new_blacklisted") is not None:
+                            contact["blacklisted"] = data.get("new_blacklisted")
+                        # 向后兼容：老 WAL 可能包含 blacklisted 字段直接在 data 中
+                        if data.get("blacklisted") is not None:
+                            contact["blacklisted"] = data.get("blacklisted")
+                        # 注意：如果需要单独的黑名单操作，也会在下方单独处理
             except Exception:
                 continue
+
+                # 单独的黑名单操作（便于在查找时快速切换状态）
+                try:
+                    if op == "blacklist":
+                        cid = data.get("id")
+                        target = None
+                        if cid is not None:
+                            target = next((c for c in self.contacts if c.get("id") == cid), None)
+                        else:
+                            name = data.get("name")
+                            target = next((c for c in self.contacts if c.get("name") == name), None)
+                        if target:
+                            target["blacklisted"] = data.get("blacklisted", True)
+                except Exception:
+                    pass
 
         # 重放完成后，保存一次快照并清空 WAL
         try:
             self._persist_state()
         except Exception:
             pass
+
+    # ---------- 黑名单相关方法 ----------
+    def set_blacklist(self, name, blacklisted=True):
+        """根据姓名设置黑名单状态（写 WAL 并持久化）。"""
+        contact = self.search_contact(name)
+        if not contact:
+            print(f"未找到联系人：{name}")
+            return False
+        cid = contact.get("id")
+        entry = {"op": "blacklist", "data": {"id": cid, "blacklisted": bool(blacklisted)}}
+        try:
+            self._wal_append(entry)
+        except Exception:
+            print("操作失败：无法写入 WAL。")
+            return False
+
+        contact["blacklisted"] = bool(blacklisted)
+        try:
+            self._persist_state()
+        except Exception:
+            print("警告：内存已更新，但持久化失败，WAL 中有未完成事务。")
+            return False
+
+        state = "已加入黑名单" if contact.get("blacklisted") else "已移出黑名单"
+        print(f"联系人 {contact.get('name')} {state}。")
+        return True
 
  # ----------------- Trie 性能基准工具 -----------------
 def _random_name(min_len=3, max_len=10):
@@ -661,7 +710,12 @@ if __name__=="__main__":
                 name = input("请输入要查找的联系人姓名：")
                 contact = cl.search_contact(name)
                 if contact:
-                    print(f"找到联系人：名称: {contact.get('name')}, 电话: {contact.get('phone_number')}, 性别: {contact.get('gender')}, 备注: {contact.get('remark')}")
+                    status = "黑名单" if contact.get('blacklisted') else "正常"
+                    print(f"找到联系人：名称: {contact.get('name')}, 电话: {contact.get('phone_number')}, 性别: {contact.get('gender')}, 状态: {status}, 备注: {contact.get('remark')}")
+                    # 提供切换黑名单状态的选项
+                    ans = input("是否切换该联系人黑名单状态？(y/n)：").strip().lower()
+                    if ans == 'y':
+                        cl.set_blacklist(contact.get('name'), not contact.get('blacklisted', False))
                 else:
                     print("该联系人不存在")
             elif mode == "2":
@@ -671,7 +725,17 @@ if __name__=="__main__":
                     print("未找到匹配的联系人。")
                 else:
                     for i, c in enumerate(results, start=1):
-                        print(f"{i}. 名称: {c.get('name')}, 电话: {c.get('phone_number')}, 性别: {c.get('gender')}, 备注: {c.get('remark')}")
+                        status = "黑名单" if c.get('blacklisted') else "正常"
+                        print(f"{i}. 名称: {c.get('name')}, 电话: {c.get('phone_number')}, 性别: {c.get('gender')}, 状态: {status}, 备注: {c.get('remark')}")
+                    sel = input("输入序号切换该联系人黑名单状态（回车跳过）：").strip()
+                    if sel:
+                        try:
+                            idx = int(sel)
+                            if 1 <= idx <= len(results):
+                                c = results[idx-1]
+                                cl.set_blacklist(c.get('name'), not c.get('blacklisted', False))
+                        except Exception:
+                            pass
             elif mode == "3":
                 suffix = input("请输入手机号后缀（例如尾号）：")
                 results = cl.search_by_phone_suffix(suffix)
@@ -679,7 +743,17 @@ if __name__=="__main__":
                     print("未找到匹配的联系人。")
                 else:
                     for i, c in enumerate(results, start=1):
-                        print(f"{i}. 名称: {c.get('name')}, 电话: {c.get('phone_number')}, 性别: {c.get('gender')}, 备注: {c.get('remark')}")
+                        status = "黑名单" if c.get('blacklisted') else "正常"
+                        print(f"{i}. 名称: {c.get('name')}, 电话: {c.get('phone_number')}, 性别: {c.get('gender')}, 状态: {status}, 备注: {c.get('remark')}")
+                    sel = input("输入序号切换该联系人黑名单状态（回车跳过）：").strip()
+                    if sel:
+                        try:
+                            idx = int(sel)
+                            if 1 <= idx <= len(results):
+                                c = results[idx-1]
+                                cl.set_blacklist(c.get('name'), not c.get('blacklisted', False))
+                        except Exception:
+                            pass
             elif mode == "4":
                 gender_q = input("请输入要查询的性别：").strip()
                 results = cl.search_by_gender(gender_q)
@@ -687,7 +761,17 @@ if __name__=="__main__":
                     print("未找到匹配的联系人。")
                 else:
                     for i, c in enumerate(results, start=1):
-                        print(f"{i}. 名称: {c.get('name')}, 电话: {c.get('phone_number')}, 性别: {c.get('gender')}, 备注: {c.get('remark')}")
+                        status = "黑名单" if c.get('blacklisted') else "正常"
+                        print(f"{i}. 名称: {c.get('name')}, 电话: {c.get('phone_number')}, 性别: {c.get('gender')}, 状态: {status}, 备注: {c.get('remark')}")
+                    sel = input("输入序号切换该联系人黑名单状态（回车跳过）：").strip()
+                    if sel:
+                        try:
+                            idx = int(sel)
+                            if 1 <= idx <= len(results):
+                                c = results[idx-1]
+                                cl.set_blacklist(c.get('name'), not c.get('blacklisted', False))
+                        except Exception:
+                            pass
             else:
                 print("无效的查找方式。")
         
