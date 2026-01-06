@@ -5,7 +5,6 @@ import pickle
 import random
 import string
 import time
-import sys
 
 # 前缀索引（按联系人姓名），索引使用联系人id
 class TrieNode:
