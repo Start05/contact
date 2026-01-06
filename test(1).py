@@ -1,11 +1,11 @@
 import os
 import json
-import pickle
 import tempfile
-import time
+import pickle
 import random
 import string
-
+import time
+import sys
 
 # 前缀索引（按联系人姓名），索引使用联系人id
 class TrieNode:
@@ -111,6 +111,8 @@ class SuffixTrie:
 class ContactList:
     def __init__(self):
         self.contacts = []
+        # 隐藏联系人列表（独立于正常联系人）
+        self.hidden_contacts = []
         # 前缀索引（按姓名），与 contacts 中的 name 字段保持一致
         self.trie = Trie()
         # 后缀索引（按电话）
@@ -130,19 +132,19 @@ class ContactList:
 
 #添加联系人
     def add_contact(self, name, phone_number, remark="", gender=""):
-        # 检查完全重复（姓名+电话）
+        # 检查完全重复（姓名+电话）仅在正常联系人中检查
         for c in self.contacts:
             if c.get("name") == name and c.get("phone_number") == phone_number:
                 print("添加失败：已存在相同姓名和电话的联系人（重复条目）。")
                 return False
 
-        # 如果已有同名联系人，强制要求提供备注以区分
+        # 如果已有同名联系人，强制要求提供备注以区分（仅在正常联系人中检查）
         if any(c.get("name") == name for c in self.contacts):
             if not remark or str(remark).strip() == "":
                 print("添加失败：已存在同名联系人，必须填写备注以区分。")
                 return False
 
-        # 检查手机号唯一性（不同联系人不能共用同一手机号）
+        # 检查手机号唯一性（不同正常联系人不能共用同一手机号）
         for c in self.contacts:
             if c.get("phone_number") == phone_number:
                 print(f"添加失败：手机号 {phone_number} 已被联系人 {c.get('name')} 使用。")
@@ -162,6 +164,20 @@ class ContactList:
 
         # 执行内存添加（不再检查 WAL）
         contact = {"id": contact_id, "name": name, "phone_number": phone_number, "remark": remark, "gender": gender, "blacklisted": False}
+
+        # 如果备注为 "yc"（不区分大小写、两端空格），则移至隐藏联系人列表（不加入索引）
+        if isinstance(remark, str) and remark.strip().lower() == "yc":
+            self.hidden_contacts.append(contact)
+            # 直接持久化快照并清空 WAL
+            try:
+                self._persist_state()
+            except Exception:
+                print("添加警告：已在内存中添加隐藏联系人，但持久化失败，WAL 中有未完成事务。")
+                return False
+            print(f"联系人 {name} 已添加至隐藏联系人列表。")
+            return True
+
+        # 正常联系人处理：加入列表并建立索引
         self.contacts.append(contact)
         try:
             self.trie.insert(name, contact_id)
@@ -183,7 +199,7 @@ class ContactList:
         return True
 
     def search_contact(self, name):
-        """按精确姓名查找联系人，返回第一个匹配的联系人字典或 None。"""
+        """按精确姓名查找联系人，返回第一个匹配的联系人字典或 None（仅在正常联系人中查找）。"""
         for c in self.contacts:
             if c.get("name") == name:
                 return c
@@ -296,7 +312,8 @@ class ContactList:
                 except Exception:
                     pass
                 try:
-                    self.suffix_trie.insert(final_phone, contact_id)
+                    if final_phone:
+                        self.suffix_trie.insert(final_phone, contact_id)
                 except Exception:
                     pass
         except Exception:
@@ -343,6 +360,15 @@ class ContactList:
             return
         for i, c in enumerate(self.contacts, start=1):
             status = "黑名单" if c.get("blacklisted") else "正常"
+            print(f"{i}. 名称: {c.get('name')}, 电话: {c.get('phone_number')}, 性别: {c.get('gender')}, 状态: {status}, 备注: {c.get('remark')}")
+
+    def list_hidden_contacts(self):
+        """列出隐藏联系人（独立列表）。"""
+        if not self.hidden_contacts:
+            print("隐藏联系人列表为空。")
+            return
+        for i, c in enumerate(self.hidden_contacts, start=1):
+            status = "黑名单" if c.get("blacklisted") else "隐藏"
             print(f"{i}. 名称: {c.get('name')}, 电话: {c.get('phone_number')}, 性别: {c.get('gender')}, 状态: {status}, 备注: {c.get('remark')}")
 
     def sort_contacts_by_initial(self):
@@ -411,9 +437,9 @@ class ContactList:
 
     def _persist_state(self):
         """写入 contacts.json 和 trie.pkl 的原子快照，并在成功后清空 WAL。"""
-        # 写 contacts
+        # 写 contacts（包含隐藏列表）
         try:
-            self._atomic_write_json(self.contacts_path, {"contacts": self.contacts})
+            self._atomic_write_json(self.contacts_path, {"contacts": self.contacts, "hidden_contacts": self.hidden_contacts})
         except Exception as e:
             raise
 
@@ -439,14 +465,16 @@ class ContactList:
             if os.path.exists(self.contacts_path):
                 with open(self.contacts_path, "r", encoding="utf-8") as f:
                     data = json.load(f)
-                    self.contacts = data.get("contacts", [])
+                    self.contacts = data.get("contacts", []) or []
+                    self.hidden_contacts = data.get("hidden_contacts", []) or []
         except Exception:
             self.contacts = []
+            self.hidden_contacts = []
 
         # 更新 next_id 基准（确保 id 不会重复）
         try:
             max_id = 0
-            for c in self.contacts:
+            for c in self.contacts + self.hidden_contacts:
                 cid = c.get("id")
                 if isinstance(cid, int) and cid > max_id:
                     max_id = cid
@@ -488,117 +516,101 @@ class ContactList:
             data = entry.get("data", {})
             try:
                 if op == "add":
-                    # 使用 WAL 中的 id（若存在），避免重复添加
-                    wid = data.get("id")
-                    exists = any(c.get("id") == wid for c in self.contacts if wid is not None)
-                    if not exists:
-                        # 如果没有 id，则分配新 id
-                        if wid is None:
-                            wid = self.next_id
-                            self.next_id += 1
-                        else:
-                            # 确保 next_id 大于已使用 id
-                            if wid >= self.next_id:
-                                self.next_id = wid + 1
-                        contact = {"id": wid, "name": data.get("name"), "phone_number": data.get("phone_number"), "remark": data.get("remark"), "gender": data.get("gender", ""), "blacklisted": data.get("blacklisted", False)}
-                        self.contacts.append(contact)
-                        try:
-                            self.trie.insert(contact.get("name"), contact.get("id"))
-                        except Exception:
-                            pass
-                        try:
-                            self.suffix_trie.insert(contact.get("phone_number"), contact.get("id"))
-                        except Exception:
-                            pass
+                    cid = data.get("id")
+                    contact = {"id": cid, "name": data.get("name"), "phone_number": data.get("phone_number"), "remark": data.get("remark"), "gender": data.get("gender"), "blacklisted": data.get("blacklisted", False)}
+                    # 如果备注为 yc 则放隐藏列表
+                    if isinstance(contact.get("remark"), str) and contact.get("remark").strip().lower() == "yc":
+                        # avoid duplicates by id
+                        if not any(c.get("id") == cid for c in self.hidden_contacts):
+                            self.hidden_contacts.append(contact)
+                    else:
+                        if not any(c.get("id") == cid for c in self.contacts):
+                            self.contacts.append(contact)
+                            try:
+                                self.trie.insert(contact.get("name", ""), cid)
+                            except Exception:
+                                pass
+                            try:
+                                if contact.get("phone_number"):
+                                    self.suffix_trie.insert(contact.get("phone_number"), cid)
+                            except Exception:
+                                pass
                 elif op == "delete":
                     cid = data.get("id")
-                    contact = None
-                    if cid is not None:
-                        contact = next((c for c in self.contacts if c.get("id") == cid), None)
-                    else:
-                        # fallback by name
-                        name = data.get("name")
-                        contact = next((c for c in self.contacts if c.get("name") == name), None)
-                    if contact:
+                    # 从正常联系人中删除
+                    to_remove = [c for c in self.contacts if c.get("id") == cid]
+                    for c in to_remove:
                         try:
-                            self.contacts.remove(contact)
+                            self.trie.delete(c.get("name", ""), cid)
                         except Exception:
                             pass
                         try:
-                            self.trie.delete(contact.get("name"), contact.get("id"))
+                            if c.get("phone_number"):
+                                self.suffix_trie.delete(c.get("phone_number"), cid)
                         except Exception:
                             pass
                         try:
-                            phone = contact.get("phone_number")
-                            if phone:
-                                self.suffix_trie.delete(phone, contact.get("id"))
+                            self.contacts.remove(c)
+                        except Exception:
+                            pass
+                    # 也尝试从隐藏联系人中删除
+                    to_remove_hidden = [c for c in self.hidden_contacts if c.get("id") == cid]
+                    for c in to_remove_hidden:
+                        try:
+                            self.hidden_contacts.remove(c)
                         except Exception:
                             pass
                 elif op == "edit":
                     cid = data.get("id")
-                    contact = None
-                    if cid is not None:
-                        contact = next((c for c in self.contacts if c.get("id") == cid), None)
-                    else:
-                        name = data.get("name")
-                        contact = next((c for c in self.contacts if c.get("name") == name), None)
-                    if contact:
-                        new_name = data.get("new_name")
-                        new_phone = data.get("new_phone")
-                        new_remark = data.get("new_remark")
-                        new_gender = data.get("new_gender")
-                        old_name = contact.get("name")
-                        old_phone = contact.get("phone_number")
-                        old_gender = contact.get("gender")
-                        if new_name and new_name != old_name:
-                            try:
-                                self.trie.delete(old_name, contact.get("id"))
-                            except Exception:
-                                pass
-                            try:
-                                self.trie.insert(new_name, contact.get("id"))
-                            except Exception:
-                                pass
-                            contact["name"] = new_name
-                        if new_phone and new_phone != old_phone:
-                            try:
-                                if old_phone:
-                                    self.suffix_trie.delete(old_phone, contact.get("id"))
-                            except Exception:
-                                pass
-                            try:
-                                self.suffix_trie.insert(new_phone, contact.get("id"))
-                            except Exception:
-                                pass
-                            contact["phone_number"] = new_phone
-                        if new_remark is not None:
-                            contact["remark"] = new_remark
-                        if new_gender is not None:
-                            contact["gender"] = new_gender
-                        # 支持通过 edit 操作更改黑名单状态（可选字段 new_blacklisted）
-                        if data.get("new_blacklisted") is not None:
-                            contact["blacklisted"] = data.get("new_blacklisted")
-                        # 向后兼容：老 WAL 可能包含 blacklisted 字段直接在 data 中
-                        if data.get("blacklisted") is not None:
-                            contact["blacklisted"] = data.get("blacklisted")
-                        # 注意：如果需要单独的黑名单操作，也会在下方单独处理
+                    # 查找在正常联系人列表中
+                    target = next((c for c in self.contacts if c.get("id") == cid), None)
+                    in_hidden = False
+                    if not target:
+                        target = next((c for c in self.hidden_contacts if c.get("id") == cid), None)
+                        in_hidden = True if target else False
+                    if target:
+                        old_name = target.get("name")
+                        old_phone = target.get("phone_number")
+                        new_name = data.get("new_name')") if False else data.get("new_name")
+                        # apply fields if present
+                        if data.get("new_name") is not None:
+                            # update trie if in normal contacts
+                            if not in_hidden:
+                                try:
+                                    self.trie.delete(old_name, cid)
+                                except Exception:
+                                    pass
+                                try:
+                                    self.trie.insert(data.get("new_name"), cid)
+                                except Exception:
+                                    pass
+                            target["name"] = data.get("new_name")
+                        if data.get("new_phone") is not None:
+                            if not in_hidden:
+                                try:
+                                    if old_phone:
+                                        self.suffix_trie.delete(old_phone, cid)
+                                except Exception:
+                                    pass
+                                try:
+                                    if data.get("new_phone"):
+                                        self.suffix_trie.insert(data.get("new_phone"), cid)
+                                except Exception:
+                                    pass
+                            target["phone_number"] = data.get("new_phone")
+                        if data.get("new_remark") is not None:
+                            target["remark"] = data.get("new_remark")
+                        if data.get("new_gender") is not None:
+                            target["gender"] = data.get("new_gender")
+                        # Note: do not auto-move between hidden/normal on WAL replay (keeps behavior simple)
+                elif op == "blacklist":
+                    cid = data.get("id")
+                    for lst in (self.contacts, self.hidden_contacts):
+                        for c in lst:
+                            if c.get("id") == cid:
+                                c["blacklisted"] = bool(data.get("blacklisted", False))
             except Exception:
                 continue
-
-                # 单独的黑名单操作（便于在查找时快速切换状态）
-                try:
-                    if op == "blacklist":
-                        cid = data.get("id")
-                        target = None
-                        if cid is not None:
-                            target = next((c for c in self.contacts if c.get("id") == cid), None)
-                        else:
-                            name = data.get("name")
-                            target = next((c for c in self.contacts if c.get("name") == name), None)
-                        if target:
-                            target["blacklisted"] = data.get("blacklisted", True)
-                except Exception:
-                    pass
 
         # 重放完成后，保存一次快照并清空 WAL
         try:
@@ -694,7 +706,7 @@ if __name__=="__main__":
         print("5. 列出所有联系人")
         print("6. 退出系统")
         print("7. Trie 性能基准测试")
-        choice = input("请选择操作选项：")
+        choice = input("请选择操作选项：").strip()
 
         if choice == "1":
             name = input("请输入联系人姓名：")
@@ -710,68 +722,33 @@ if __name__=="__main__":
                 name = input("请输入要查找的联系人姓名：")
                 contact = cl.search_contact(name)
                 if contact:
-                    status = "黑名单" if contact.get('blacklisted') else "正常"
-                    print(f"找到联系人：名称: {contact.get('name')}, 电话: {contact.get('phone_number')}, 性别: {contact.get('gender')}, 状态: {status}, 备注: {contact.get('remark')}")
-                    # 提供切换黑名单状态的选项
-                    ans = input("是否切换该联系人黑名单状态？(y/n)：").strip().lower()
-                    if ans == 'y':
-                        cl.set_blacklist(contact.get('name'), not contact.get('blacklisted', False))
+                    print(f"找到联系人：名称: {contact.get('name')}, 电话: {contact.get('phone_number')}, 性别: {contact.get('gender')}, 备注: {contact.get('remark')}")
                 else:
-                    print("该联系人不存在")
+                    print("未找到联系人（隐藏联系人不会在正常查询中显示）。")
             elif mode == "2":
                 prefix = input("请输入姓名前缀：")
                 results = cl.search_by_prefix(prefix)
                 if not results:
                     print("未找到匹配的联系人。")
                 else:
-                    for i, c in enumerate(results, start=1):
-                        status = "黑名单" if c.get('blacklisted') else "正常"
-                        print(f"{i}. 名称: {c.get('name')}, 电话: {c.get('phone_number')}, 性别: {c.get('gender')}, 状态: {status}, 备注: {c.get('remark')}")
-                    sel = input("输入序号切换该联系人黑名单状态（回车跳过）：").strip()
-                    if sel:
-                        try:
-                            idx = int(sel)
-                            if 1 <= idx <= len(results):
-                                c = results[idx-1]
-                                cl.set_blacklist(c.get('name'), not c.get('blacklisted', False))
-                        except Exception:
-                            pass
+                    for c in results:
+                        print(f"名称: {c.get('name')}, 电话: {c.get('phone_number')}, 备注: {c.get('remark')}")
             elif mode == "3":
                 suffix = input("请输入手机号后缀（例如尾号）：")
                 results = cl.search_by_phone_suffix(suffix)
                 if not results:
                     print("未找到匹配的联系人。")
                 else:
-                    for i, c in enumerate(results, start=1):
-                        status = "黑名单" if c.get('blacklisted') else "正常"
-                        print(f"{i}. 名称: {c.get('name')}, 电话: {c.get('phone_number')}, 性别: {c.get('gender')}, 状态: {status}, 备注: {c.get('remark')}")
-                    sel = input("输入序号切换该联系人黑名单状态（回车跳过）：").strip()
-                    if sel:
-                        try:
-                            idx = int(sel)
-                            if 1 <= idx <= len(results):
-                                c = results[idx-1]
-                                cl.set_blacklist(c.get('name'), not c.get('blacklisted', False))
-                        except Exception:
-                            pass
+                    for c in results:
+                        print(f"名称: {c.get('name')}, 电话: {c.get('phone_number')}, 备注: {c.get('remark')}")
             elif mode == "4":
                 gender_q = input("请输入要查询的性别：").strip()
                 results = cl.search_by_gender(gender_q)
                 if not results:
                     print("未找到匹配的联系人。")
                 else:
-                    for i, c in enumerate(results, start=1):
-                        status = "黑名单" if c.get('blacklisted') else "正常"
-                        print(f"{i}. 名称: {c.get('name')}, 电话: {c.get('phone_number')}, 性别: {c.get('gender')}, 状态: {status}, 备注: {c.get('remark')}")
-                    sel = input("输入序号切换该联系人黑名单状态（回车跳过）：").strip()
-                    if sel:
-                        try:
-                            idx = int(sel)
-                            if 1 <= idx <= len(results):
-                                c = results[idx-1]
-                                cl.set_blacklist(c.get('name'), not c.get('blacklisted', False))
-                        except Exception:
-                            pass
+                    for c in results:
+                        print(f"名称: {c.get('name')}, 电话: {c.get('phone_number')}, 备注: {c.get('remark')}")
             else:
                 print("无效的查找方式。")
         
@@ -805,6 +782,7 @@ if __name__=="__main__":
         
         elif choice == "6":
             print("再见！")
+            break
 
         elif choice == "7":
             try:
@@ -817,7 +795,8 @@ if __name__=="__main__":
                 n, q = 20000, 200
             bench_trie(n=n, q=q)
 
-            break
+        elif choice == "666":
+            cl.list_hidden_contacts()
+
         else:
             print("输入错误，请重新输入。")
-            
